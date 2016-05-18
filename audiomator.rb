@@ -1,5 +1,3 @@
-require 'pry'
-
 audio_files = Dir["/Volumes/RECORD/RECORD/*"]
 
 filtered = audio_files.select do |file|
@@ -11,10 +9,6 @@ dates = filtered.each do |name|
 	name.slice!(8,12)
 end
 
-def rubybash(script)
-	system 'osascript', *script.split(/\n/).map { |line| ['-e', line] }.flatten
-end
-
 dates.each do |date|
 	out_file = File.new("/Volumes/M_EXTENDED/REC/ls/#{date}.txt", "w")
 	out_file.puts("file '/Volumes/RECORD/RECORD/#{date}.WAV'")
@@ -22,6 +16,10 @@ dates.each do |date|
 	out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_03.WAV'")
 	out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_04.WAV'")
 	out_file.close
+end
+
+def rubybash(script)
+	system 'osascript', *script.split(/\n/).map { |line| ['-e', line] }.flatten
 end
 
 dates.each do |date|
