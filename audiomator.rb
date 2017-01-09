@@ -1,13 +1,13 @@
 require 'pry'
 
-def directory_exists?(directory)
+def files_in_directory?(directory)
   directory.any?
 end
 
-if directory_exists?(Dir['/Volumes/RECORD/RECORD/VOICE/*'])
+if files_in_directory?(Dir['/Volumes/RECORD/RECORD/VOICE/*'])
   folder_string = '/Volumes/RECORD/RECORD/VOICE/'
   stop_char     = 29
-elsif directory_exists?(Dir['/Volumes/RECORD/RECORD/'])
+elsif files_in_directory?(Dir['/Volumes/RECORD/RECORD/*'])
   folder_string = '/Volumes/RECORD/RECORD/'
   stop_char     = 23
 else
