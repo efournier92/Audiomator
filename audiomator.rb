@@ -1,8 +1,13 @@
 require 'pry'
 
+def directory_exists?(directory)
+  File.directory?(directory)
+end
+
 audio_files = Dir["/Volumes/RECORD/RECORD/VOICE/*"]
 file_string = '/Volumes/RECORD/RECORD/VOICE/'
 stop = 29
+
 unless audio_files.any?
   audio_files = Dir["/Volumes/RECORD/RECORD/*"]
   file_string = '/Volumes/RECORD/RECORD/'
