@@ -1,9 +1,11 @@
 require 'pry'
 
 audio_files = Dir["/Volumes/RECORD/RECORD/VOICE/*"]
+file_string = '/Volumes/RECORD/RECORD/VOICE/'
 stop = 29
 unless audio_files.any?
   audio_files = Dir["/Volumes/RECORD/RECORD/*"]
+  file_string = '/Volumes/RECORD/RECORD/'
   stop = 23
 end
 
@@ -21,16 +23,13 @@ def rubybash(script)
 end
 
 dates.each do |date|
+  i = 2
   out_file = File.new("/Volumes/M_EXTENDED/REC/ls/#{date}.txt", "w")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_02.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_03.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_04.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_05.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_06.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_07.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_08.WAV'")
-  out_file.puts("file '/Volumes/RECORD/RECORD/#{date}_09.WAV'")
+  out_file.puts("file #{file_string}#{date}.WAV'")
+  while i <= 9 do
+    out_file.puts("file #{file_string}#{date}_0#{i}.WAV'")
+    i+=1
+  end
   out_file.close
 end
 
