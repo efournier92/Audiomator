@@ -11,7 +11,7 @@ elsif directory_exists?(Dir['/Volumes/RECORD/RECORD/'])
   folder_string = '/Volumes/RECORD/RECORD/'
   stop_char     = 23
 else
-  abort('No files found...')
+  abort('ERROR: No files found.')
 end
 
 audio_files = Dir[folder_string + '*'] 
