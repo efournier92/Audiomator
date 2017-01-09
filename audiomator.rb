@@ -26,9 +26,10 @@ dates.each do |date|
   i = 2
   out_file = File.new("/Volumes/M_EXTENDED/REC/ls/#{date}.txt", "w")
   out_file.puts("file #{file_string}#{date}.WAV'")
+
   while i <= 9 do
     out_file.puts("file #{file_string}#{date}_0#{i}.WAV'")
-    i+=1
+    i+=2
   end
   out_file.close
 end
