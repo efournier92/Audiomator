@@ -35,7 +35,7 @@ dates.each do |date|
 
   while i <= 9 do
     out_file.puts("file #{folder_string}#{date}_0#{i}.WAV'")
-    i+=2
+    i += 1
   end
   out_file.close
 end
