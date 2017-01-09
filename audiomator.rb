@@ -1,8 +1,10 @@
 require 'pry'
 
 audio_files = Dir["/Volumes/RECORD/RECORD/VOICE/*"]
+stop = 29
 unless audio_files.any?
   audio_files = Dir["/Volumes/RECORD/RECORD/*"]
+  stop = 23
 end
 
 filtered = audio_files.select do |file|
@@ -10,8 +12,8 @@ filtered = audio_files.select do |file|
 end
 
 dates = filtered.each do |name|
-  name.slice!(0,23)
-  name.slice!(8,12)
+  name.slice!(0, stop)
+  name.slice!(8, 12)
 end
 
 def rubybash(script)
