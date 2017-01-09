@@ -1,21 +1,20 @@
 require 'pry'
 
 def directory_exists?(directory)
-    directory.any?
+  directory.any?
 end
 
 if directory_exists?(Dir['/Volumes/RECORD/RECORD/VOICE/*'])
-  folder_string = '/Volumes/RECORD/RECORD/VOICE/*'
+  folder_string = '/Volumes/RECORD/RECORD/VOICE/'
   stop_char     = 29
-elsif directory_exists?(Dir['/Volumes/RECORD/RECORD/*'])
-  folder_string = '/Volumes/RECORD/RECORD/*'
+elsif directory_exists?(Dir['/Volumes/RECORD/RECORD/'])
+  folder_string = '/Volumes/RECORD/RECORD/'
   stop_char     = 23
 else
   abort('No files found...')
 end
 
-audio_files = Dir[folder_string] 
-  binding.pry
+audio_files = Dir[folder_string + '*'] 
 filtered = audio_files.select do |file|
   file !~ /_/
 end
