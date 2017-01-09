@@ -1,25 +1,26 @@
 require 'pry'
 
 def directory_exists?(directory)
-  File.directory?(directory)
+    directory.any?
 end
 
-audio_files = Dir["/Volumes/RECORD/RECORD/VOICE/*"]
-file_string = '/Volumes/RECORD/RECORD/VOICE/'
-stop = 29
-
-unless audio_files.any?
-  audio_files = Dir["/Volumes/RECORD/RECORD/*"]
-  file_string = '/Volumes/RECORD/RECORD/'
-  stop = 23
+if directory_exists?(Dir['/Volumes/RECORD/RECORD/VOICE/*'])
+  folder_string = '/Volumes/RECORD/RECORD/VOICE/'
+  stop_char     = 29
+elsif directory_exists?(Dir['/Volumes/RECORD/RECORD/*'])
+  folder_string = '/Volumes/RECORD/RECORD/'
+  stop_char     = 23
+else
+  abort('No files found...')
 end
 
+audio_files = Dir[folder_string] 
 filtered = audio_files.select do |file|
   file !~ /_/
 end
 
 dates = filtered.each do |name|
-  name.slice!(0, stop)
+  name.slice!(0, stop_char)
   name.slice!(8, 12)
 end
 
