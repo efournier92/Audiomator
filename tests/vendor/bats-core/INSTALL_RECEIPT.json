@@ -1,0 +1,32 @@
+{
+  "homebrew_version": "6.0.12-64-gd0b3972",
+  "used_options": [],
+  "unused_options": [],
+  "built_as_bottle": true,
+  "poured_from_bottle": true,
+  "loaded_from_api": true,
+  "loaded_from_internal_api": true,
+  "installed_on_request": true,
+  "changed_files": [],
+  "time": 1794109840,
+  "source_modified_time": 1784663601,
+  "compiler": "gcc-13",
+  "aliases": [
+    "bats"
+  ],
+  "runtime_dependencies": [],
+  "source": {
+    "spec": "stable",
+    "versions": {
+      "stable": "1.14.0",
+      "head": null,
+      "version_scheme": 0,
+      "compatibility_version": null
+    },
+    "path": "/Users/e/Library/Caches/Homebrew/api/internal/packages.arm64_golden_gate.jws.json",
+    "tap_git_head": null,
+    "tap": "homebrew/core"
+  },
+  "arch": "arm64",
+  "built_on": null
+}
