@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+
+#----------------
+# Name          : rc_process
+# Description   : Processes raw WAV voice memos as smaller MP3 files for long-term archival storage.
+# Author        : E Fournier
+# Dependencies  : ffmpeg
+# Example Usage : ./rc_process $in_dir $out_dir [debugger]
+#----------------
+
+shopt -s extglob
+
+IS_DEBUG=false
+
+# Chunk-boundary tunables, env-overridable.
+# RC_CHUNK_MARGIN: seconds either side of 2h still counted as a full chunk.
+# RC_MAX_GAP: seconds past the expected next-chunk start still counted as one sequence.
+RC_CHUNK_MARGIN="${RC_CHUNK_MARGIN:-3}"
+RC_MAX_GAP="${RC_MAX_GAP:-60}"
+RC_WAIT_MAX="${RC_WAIT_MAX:-10000}"
+RC_POLL_INTERVAL="${RC_POLL_INTERVAL:-1}"
+RC_CONVERT_MAX_JOBS="${RC_CONVERT_MAX_JOBS:-4}"   # 0 means unlimited
+CHUNK_SECONDS=7200
+
+# Reject non-numeric tunables.
+# A bad env value cannot:
+# - Silently disable the restart logic.
+# - Trigger bash octal arithmetic errors.
+if [[ ! "$RC_CHUNK_MARGIN" =~ ^[0-9]+$ ]]; then RC_CHUNK_MARGIN=3; fi
+if [[ ! "$RC_MAX_GAP" =~ ^[0-9]+$ ]]; then RC_MAX_GAP=60; fi
+if [[ ! "$RC_WAIT_MAX" =~ ^[0-9]+$ ]]; then RC_WAIT_MAX=10000; fi
+if [[ ! "$RC_POLL_INTERVAL" =~ ^[0-9]+$ ]]; then RC_POLL_INTERVAL=1; fi
+if [[ ! "$RC_CONVERT_MAX_JOBS" =~ ^[0-9]+$ ]]; then RC_CONVERT_MAX_JOBS=4; fi
+
+RC_CHUNK_MARGIN=$((10#$RC_CHUNK_MARGIN))
+RC_MAX_GAP=$((10#$RC_MAX_GAP))
+RC_WAIT_MAX=$((10#$RC_WAIT_MAX))
+RC_POLL_INTERVAL=$((10#$RC_POLL_INTERVAL))
+RC_CONVERT_MAX_JOBS=$((10#$RC_CONVERT_MAX_JOBS))
+
+concat_dir() {
+  local out_dir="$1"
+
+  echo "$out_dir/.concat"
+}
+
+concat_file() {
+  local date=$(parse_date "$1")
+  local out_dir="$2"
+
+  local dir=$(concat_dir "$out_dir")
+
+  echo "$dir/$date.txt"
+}
+
+mp3_file() {
+  local date="$1"
+  local out_dir="$2"
+
+  echo "$out_dir/$date.mp3"
+}
+
+is_valid_file() {
+  local eval_file="$1"
+
+  if [[ -f "$eval_file" ]]; then
+    [[ "$eval_file" = *.WAV || "$eval_file" = *.wav ]] \
+      && [[ ! "$eval_file" =~ [@#\$%^\&*+] ]] \
+      && [[ "$eval_file" != *"'"* ]] \
+      && [[ "$eval_file" != *$'\n'* ]]
+  else
+    false
+  fi
+}
+
+# True when the supplied wall-clock fields form a real calendar timestamp.
+is_valid_calendar_timestamp() {
+  local year="$1"
+  local month="$2"
+  local day="$3"
+  local hour="$4"
+  local minute="$5"
+
+  (( month >= 1 && month <= 12 )) || return 1
+  (( hour >= 0 && hour <= 23 )) || return 1
+  (( minute >= 0 && minute <= 59 )) || return 1
+
+  local max_day
+  case "$month" in
+    1|3|5|7|8|10|12) max_day=31 ;;
+    4|6|9|11) max_day=30 ;;
+    2)
+      if (( (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 )); then
+        max_day=29
+      else
+        max_day=28
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+
+  (( day >= 1 && day <= max_day ))
+}
+
+is_valid_file_name() {
+  local eval_file="$1"
+
+  local file_name="${eval_file##*/}"
+  local file_name="${file_name%%.*}"
+
+  if [[ "$file_name" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{2})([0-9]{2})_([0-9]{2})$ ]]; then
+    if is_valid_calendar_timestamp \
+      "$((10#${BASH_REMATCH[1]}))" \
+      "$((10#${BASH_REMATCH[2]}))" \
+      "$((10#${BASH_REMATCH[3]}))" \
+      "$((10#${BASH_REMATCH[4]}))" \
+      "$((10#${BASH_REMATCH[5]}))"; then
+      [[ "$IS_DEBUG" = true ]] && echo "$file_name IS a valid file" >&2
+
+      true
+    else
+      [[ "$IS_DEBUG" = true ]] && echo "$file_name is NOT a valid file" >&2
+
+      false
+    fi
+  else
+    [[ "$IS_DEBUG" = true ]] && echo "$file_name is NOT a valid file" >&2
+
+    false
+  fi
+}
+
+parse_date() {
+  local eval_file="$1"
+  local file_name="${eval_file##*/}"
+  local file_name="${file_name%%.*}"
+  local file_name="${file_name%%_*}"
+
+  echo "$file_name"
+}
+
+format_duration() {
+  local total_seconds="$1"
+  local hours=$((total_seconds / 3600))
+  local minutes=$(((total_seconds % 3600) / 60))
+  local seconds=$((total_seconds % 60))
+
+  printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
+}
+
+get_formatted_duration() {
+  local file="$1"
+
+  local duration_seconds=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file" | cut -d. -f1)
+  local formatted_duration=$(format_duration "$duration_seconds")
+  echo "$formatted_duration"
+}
+
+# Convert HH:MM:SS to total seconds. Returns nonzero on malformed input.
+duration_to_seconds() {
+  local formatted="$1"
+
+  [[ "$formatted" =~ ^([0-9]+):([0-9]{2}):([0-9]{2})$ ]] || return 1
+
+  local hours=$((10#${BASH_REMATCH[1]}))
+  local minutes=$((10#${BASH_REMATCH[2]}))
+  local seconds=$((10#${BASH_REMATCH[3]}))
+
+  (( minutes < 60 )) || return 1
+  (( seconds < 60 )) || return 1
+
+  echo $((hours * 3600 + minutes * 60 + seconds))
+}
+
+# True when a duration in seconds is within margin of a full 2-hour chunk.
+is_full_chunk_seconds() {
+  local total_seconds="$1"
+  local margin="${2:-$RC_CHUNK_MARGIN}"
+
+  [[ "$total_seconds" =~ ^[0-9]+$ ]] || return 1
+
+  local delta=$((total_seconds - CHUNK_SECONDS))
+  (( delta < 0 )) && delta=$((-delta))
+
+  (( delta <= margin ))
+}
+
+# Convert a supported filename timestamp to epoch seconds.
+# Accepts YYYY_MM_DD_HH_MM_SS, YYYY-MM-DD-HHMM[_NN], and YYYYMMDDHHMM[_NN].
+filename_to_epoch() {
+  local name="${1##*/}"
+  name="${name%%.*}"
+
+  local year month day hour minute second=0 date_string
+
+  if [[ "$name" =~ ^([0-9]{4})_([0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2})$ ]]; then
+    year=$((10#${BASH_REMATCH[1]}))
+    month=$((10#${BASH_REMATCH[2]}))
+    day=$((10#${BASH_REMATCH[3]}))
+    hour=$((10#${BASH_REMATCH[4]}))
+    minute=$((10#${BASH_REMATCH[5]}))
+    second=$((10#${BASH_REMATCH[6]}))
+  elif [[ "$name" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{2})([0-9]{2})(_[0-9]{2})?$ ]]; then
+    year=$((10#${BASH_REMATCH[1]}))
+    month=$((10#${BASH_REMATCH[2]}))
+    day=$((10#${BASH_REMATCH[3]}))
+    hour=$((10#${BASH_REMATCH[4]}))
+    minute=$((10#${BASH_REMATCH[5]}))
+  elif [[ "$name" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})(_[0-9]{2})?$ ]]; then
+    year=$((10#${BASH_REMATCH[1]}))
+    month=$((10#${BASH_REMATCH[2]}))
+    day=$((10#${BASH_REMATCH[3]}))
+    hour=$((10#${BASH_REMATCH[4]}))
+    minute=$((10#${BASH_REMATCH[5]}))
+  else
+    return 1
+  fi
+
+  is_valid_calendar_timestamp "$year" "$month" "$day" "$hour" "$minute" || return 1
+  (( second >= 0 && second <= 59 )) || return 1
+
+  date_string=$(printf "%04d-%02d-%02d %02d:%02d:%02d" \
+    "$year" "$month" "$day" "$hour" "$minute" "$second")
+
+  # Treat filenames as UTC wall-clock labels so 2h arithmetic is stable across DST and host TZ.
+  local epoch
+  epoch=$(date -u -j -f "%Y-%m-%d %H:%M:%S" "$date_string" "+%s" 2>/dev/null) \
+    || epoch=$(date -u -d "$date_string" "+%s" 2>/dev/null) \
+    || return 1
+
+  [[ -n "$epoch" ]] || return 1
+
+  echo "$epoch"
+}
+
+# Decide whether the current file continues the previous sequence.
+# - "continue" or "restart".
+sequence_decision() {
+  local prev_start="$1"
+  local prev_duration_seconds="$2"
+  local current_start="$3"
+  local margin="${4:-$RC_CHUNK_MARGIN}"
+  local max_gap="${5:-$RC_MAX_GAP}"
+
+  [[ "$prev_start" =~ ^-?[0-9]+$ ]] || { echo "restart"; return 0; }
+  [[ "$prev_duration_seconds" =~ ^[0-9]+$ ]] || { echo "restart"; return 0; }
+  [[ "$current_start" =~ ^-?[0-9]+$ ]] || { echo "restart"; return 0; }
+
+  is_full_chunk_seconds "$prev_duration_seconds" "$margin" || { echo "restart"; return 0; }
+
+  local expected_next_start=$((prev_start + prev_duration_seconds))
+  local gap=$((current_start - expected_next_start))
+
+  # Backward jump or out-of-order file restarts; grace applies both ways so jitter stays one sequence.
+  (( gap < -max_gap )) && { echo "restart"; return 0; }
+
+  # Long forward jump restarts too.
+  (( gap > max_gap )) && { echo "restart"; return 0; }
+
+  echo "continue"
+}
+
+# Decide continuity using the previous file's real start when available.
+resolve_sequence_decision() {
+  local last_duration="$1"
+  local last_successful_filename="$2"
+  local current_start="$3"
+  local last_start_epoch="$4"
+
+  local prev_start="$last_start_epoch"
+  if [[ -z "$prev_start" ]]; then
+    prev_start=$(filename_to_epoch "$last_successful_filename")
+  fi
+
+  local prev_duration_seconds
+  prev_duration_seconds=$(duration_to_seconds "$last_duration")
+
+  sequence_decision "$prev_start" "$prev_duration_seconds" "$current_start"
+}
+
+# Continuity decision: same session base continues, else fall back to gap logic.
+decide_sequence() {
+  local file="$1"
+  local last_successful_filename="$2"
+  local last_duration="$3"
+  local last_start_epoch="$4"
+  local current_start_epoch="$5"
+
+  local current_base=$(try_parse_filename_from_raw "$file")
+  local last_base=$(try_parse_filename_from_raw "$last_successful_filename")
+
+  if [[ -n "$current_base" && "$current_base" == "$last_base" ]]; then
+    echo "continue"
+    return 0
+  fi
+
+  resolve_sequence_decision \
+    "$last_duration" \
+    "$last_successful_filename" \
+    "$current_start_epoch" \
+    "$last_start_epoch"
+}
+
+wait_for_ffmpeg_to_finish() {
+  [[ "$IS_DEBUG" = true ]] && echo "Started waiting for FFmpeg to finish"
+
+  local polls=0
+  local is_convert_complete=false
+
+  until [[ "$is_convert_complete" == true || "$polls" -ge "$RC_WAIT_MAX" ]]; do
+    sleep "$RC_POLL_INTERVAL"
+    polls=$((polls + 1))
+    [[ "$IS_DEBUG" = true ]] && echo "Waiting for FFmpeg: poll $polls"
+    local ffmpeg_windows=$(tmux list-windows | grep -i 'ffmpeg')
+    if [[ "$ffmpeg_windows" == '' ]]; then
+      [[ "$IS_DEBUG" = true ]] && echo "FFmpeg conversion complete"
+      is_convert_complete=true
+    fi
+  done
+
+  if [[ "$is_convert_complete" != true ]]; then
+    echo "WARNING: timed out waiting for ffmpeg after $polls polls" >&2
+  fi
+}
+
+# Throttle how many sequence encodes run at once.
+# 0 disables the cap.
+wait_for_ffmpeg_slots() {
+  local max_jobs="$1"
+  local polls=0
+
+  (( max_jobs > 0 )) || return 0
+
+  while true; do
+    local running=$(tmux list-windows 2>/dev/null | grep -ci 'ffmpeg')
+    (( running < max_jobs )) && return 0
+
+    if (( polls >= RC_WAIT_MAX )); then
+      echo "WARNING: timed out waiting for an ffmpeg slot after $polls polls" >&2
+      return 0
+    fi
+
+    sleep "$RC_POLL_INTERVAL"
+    polls=$((polls + 1))
+  done
+}
+
+convert_audio_files() {
+  local in_dir="$1"
+  local out_dir="$2"
+
+  for file_to_convert in "$in_dir"/*; do
+    [[ "$file_to_convert" = *.WAV || "$file_to_convert" = *.wav ]] || continue
+
+    if ! $(is_valid_file "$file_to_convert"); then
+      [[ "$IS_DEBUG" = true ]] && echo "Skipping invalid file $file_to_convert"
+      continue
+    fi
+
+    local date=$(parse_date "$file_to_convert")
+    local mp3_file=$(mp3_file "$date" "$out_dir")
+    local concat_file=$(concat_file "$date" "$out_dir")
+
+    if [[ "$IS_DEBUG" = true ]]; then
+      echo "------------"
+      echo "CONVERTING WITH FFMPEG:"
+      echo "  Convert File: $file_to_convert"
+      echo "  Date: $date"
+      echo "  MP3 File: $mp3_file"
+      echo "  Concat File: $concat_file"
+    fi
+
+    if [[ "$file_to_convert" =~ "_00" ]]; then
+      [[ "$IS_DEBUG" = true ]] && echo "  First File: "$file_to_convert""
+      local file_to_write=$(concat_file "$date" "$out_dir")
+      clean_concat_file "$file_to_write" "$out_dir" "$IS_DEBUG"
+      [[ "$IS_DEBUG" = true ]] && echo "  Writing concat file "$concat_file" to "$in_dir""
+
+      # Use glob to find all related WAV files
+      for f in "$in_dir/${date}"_[0-9][0-9].{WAV,wav}; do
+        if [[ -f "$f" ]]; then
+          echo "file '$f'" >> "$file_to_write"
+        fi
+      done
+
+      wait_for_ffmpeg_slots "$RC_CONVERT_MAX_JOBS"
+      if ! tmux new-window "ffmpeg -f concat -safe 0 -i \"$concat_file\" -c:a libmp3lame -ac 1 -q:a 15 \"$mp3_file\""; then
+        echo "ERROR: failed to launch ffmpeg for $date" >&2
+      fi
+    fi
+  done
+
+  wait_for_ffmpeg_to_finish
+}
+
+clean_concat_file() {
+  local clean_date=$(parse_date "$1")
+  local out_dir="$2"
+
+  local file_to_clean=$(concat_file "$clean_date" "$out_dir")
+  mkdir -p "$(concat_dir "$out_dir")"
+  [[ "$IS_DEBUG" = true ]] && echo "  Cleaning $file_to_clean in $(concat_dir "$out_dir")"
+
+  rm -f "$file_to_clean"
+  touch "$file_to_clean"
+}
+
+try_parse_filename_from_raw() {
+  local raw_file="$1"
+  local filename_no_ext="${raw_file##*/}"
+  filename_no_ext="${filename_no_ext%%.*}"
+
+  # Try to match YYYY_MM_DD_HH_MM_SS
+  if [[ "$filename_no_ext" =~ ^([0-9]{4})_([0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2})$ ]]; then
+    echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
+  # Try to match YYYY-MM-DD-HHMM_NN
+  elif [[ "$filename_no_ext" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4})(_[0-9]{2})?$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  # Try to match YYYYMMDDHHMM_NN
+  elif [[ "$filename_no_ext" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})(_[0-9]{2})?$ ]]; then
+    echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
+  else
+    echo ""
+  fi
+}
+
+# The caller computes the sequence decision once.
+calculate_default_prompt_value() {
+  local decision="$1"
+  local last_successful_filename="$2"
+  local raw_file="$3"
+  local current_date_ym_arg="$4"
+
+  if [[ "$decision" == "continue" ]]; then
+    echo "${last_successful_filename%_*}"
+    return 0
+  fi
+
+  local parsed_raw_filename=$(try_parse_filename_from_raw "$raw_file")
+  if [[ -n "$parsed_raw_filename" ]]; then
+    echo "$parsed_raw_filename"
+  else
+    echo "$current_date_ym_arg"
+  fi
+}
+
+get_next_increment() {
+  local in_dir="$1"
+  local base_name="$2"
+
+  local i=0
+  while true; do
+    local suffix=$(printf "%02d" $i)
+    local candidate="${base_name}_${suffix}"
+    if [[ ! -f "$in_dir/${candidate}.WAV" && ! -f "$in_dir/${candidate}.wav" ]]; then
+      echo "$candidate"
+      return
+    fi
+    i=$((i + 1))
+    if [[ $i -gt 99 ]]; then
+      echo "${base_name}_99"
+      return
+    fi
+  done
+}
+
+handle_user_input_and_file_action() {
+  local new_file_name_input="$1"
+  local original_file="$2"
+  local in_dir="$3"
+  local out_dir="$4"
+
+  # Return codes:
+  # 0: Action completed (break until loop)
+  # 1: Error, continue until loop
+
+  # Echoed output:
+  # <new_last_successful_filename> (if rename)
+  # "" (if delete or error where last_successful_filename should be cleared)
+
+  # Only the exact tokens d or delete, or a valid timestamp with a trailing D/d, delete a file.
+  # A trailing d on arbitrary text must not silently destroy a raw recording.
+  local delete_requested=false
+  if [[ "${new_file_name_input,,}" == "d" || "${new_file_name_input,,}" == "delete" ]]; then
+    delete_requested=true
+  elif [[ "$new_file_name_input" =~ [Dd]$ ]] && filename_to_epoch "${new_file_name_input%?}" >/dev/null; then
+    delete_requested=true
+  fi
+
+  if [[ "$delete_requested" == true ]]; then
+    rm "$original_file"
+    echo "DELETED: $original_file" >&2
+    echo ""
+    return 0
+  fi
+
+  local base_name
+  local final_name
+
+  if [[ "$new_file_name_input" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4})(_[0-9]{2})?$ ]]; then
+    base_name="${BASH_REMATCH[1]}"
+    final_name=$(get_next_increment "$in_dir" "$base_name")
+
+    mkdir -p "$out_dir"
+    mv -n "$original_file" "$in_dir/$final_name.WAV"
+    [[ "$IS_DEBUG" = true ]] && echo "Renamed '$original_file' to '$final_name.WAV'" >&2
+    echo "$final_name"
+    return 0
+  else
+    echo "ERROR: Invalid file name format. Please enter a valid name (yyyy-mm-dd-HHMM)." >&2
+    echo ""
+    return 1
+  fi
+}
+
+# Prompt until a valid name is accepted.
+# Echoes the resulting name (empty on delete).
+# Returns nonzero if input ends.
+prompt_for_file_name() {
+  local file="$1"
+  local file_size="$2"
+  local current_duration="$3"
+  local decision="$4"
+  local default_name="$5"
+  local in_dir="$6"
+  local out_dir="$7"
+
+  local new_file_name="$file"
+
+  until is_valid_file_name "$new_file_name"; do
+    local ffplay_process=""
+    if command -v ffplay >/dev/null 2>&1; then
+      ffplay -nodisp -autoexit "$file" > /dev/null 2>&1 &
+      ffplay_process=$!
+      sleep 0.1
+    fi
+
+    # minimalist: display lines go to stderr so the caller's command
+    # substitution captures only the echoed result name.
+    local decision_label="Restarting"
+    [[ "$decision" == "continue" ]] && decision_label="Continuing"
+    echo "[$file | $file_size | $current_duration] $decision_label" >&2
+
+    if ! read -p "[yyyy-mm-dd-HHMM]: " -i "$default_name" -e new_file_name; then
+      echo "ERROR: no input; stopping." >&2
+      [[ -n "$ffplay_process" ]] && kill "$ffplay_process" 2>/dev/null
+      return 1
+    fi
+    [[ -n "$ffplay_process" ]] && kill "$ffplay_process" 2>/dev/null
+
+    # An empty line accepts the computed default.
+    if [[ -z "$new_file_name" ]]; then
+      new_file_name="$default_name"
+    fi
+
+    local result
+    result=$(handle_user_input_and_file_action "$new_file_name" "$file" "$in_dir" "$out_dir")
+    if [[ $? -eq 0 ]]; then
+      echo "$result"
+      return 0
+    fi
+  done
+}
+
+name_audio_files() {
+  local in_dir="$1"
+  local out_dir="$2"
+  local last_successful_filename=""
+  local last_start_epoch=""
+  local last_start_target=""
+  local last_duration=""
+  local last_probe_target=""
+  local current_date_ym=$(date "+%Y-%m-")
+
+  for file in "$in_dir"/*.@(WAV|wav); do
+    [[ -e "$file" ]] || continue
+    is_valid_file "$file" || continue
+
+    if is_valid_file_name "$file"; then
+      local already_named="${file##*/}"
+      last_successful_filename="${already_named%%.*}"
+      # Defer probing and timestamp parsing.
+      # - Until a later raw file needs them.
+      # A rerun over already-named files costs no subprocesses here.
+      last_duration=""
+      last_probe_target="$file"
+      last_start_epoch=""
+      last_start_target="$file"
+      continue
+    fi
+
+    local current_start_epoch=$(filename_to_epoch "$file")
+    local file_size=$(du -h "$file" | awk '{print $1}')
+    local current_duration=$(get_formatted_duration "$file")
+
+    if [[ -z "$last_start_epoch" && -n "$last_start_target" ]]; then
+      last_start_epoch=$(filename_to_epoch "$last_start_target")
+    fi
+    if [[ -z "$last_duration" && -n "$last_probe_target" ]]; then
+      last_duration=$(get_formatted_duration "$last_probe_target")
+    fi
+
+    local decision=$(decide_sequence \
+      "$file" \
+      "$last_successful_filename" \
+      "$last_duration" \
+      "$last_start_epoch" \
+      "$current_start_epoch")
+
+    local default_prompt_value=$(calculate_default_prompt_value \
+      "$decision" \
+      "$last_successful_filename" \
+      "$file" \
+      "$current_date_ym")
+
+    local new_name
+    new_name=$(prompt_for_file_name \
+      "$file" \
+      "$file_size" \
+      "$current_duration" \
+      "$decision" \
+      "$default_prompt_value" \
+      "$in_dir" \
+      "$out_dir")
+    local prompt_status=$?
+    [[ "$prompt_status" -eq 0 ]] || return 1
+
+    if [[ -n "$new_name" ]]; then
+      last_successful_filename="$new_name"
+      last_duration="$current_duration"
+      last_probe_target=""
+      last_start_epoch="$current_start_epoch"
+      last_start_target=""
+    else
+      # Delete or failed action restarts the next sequence.
+      last_successful_filename=""
+      last_duration=""
+      last_probe_target=""
+      last_start_epoch=""
+      last_start_target=""
+    fi
+  done
+}
+
+ensure_valid_directories() {
+  local in_dir="$1"
+  local out_dir="$2"
+
+  if [[ ! -d "$in_dir" || -z "$out_dir" ]]; then
+    echo "Input and output directories expected (in='$in_dir', out='$out_dir')." >&2
+    return 1
+  else
+    if [[ "$IS_DEBUG" = true ]]; then
+      echo "INPUT DIRECTORY: $in_dir"
+      echo "OUTPUT DIRECTORY: $out_dir"
+    fi
+  fi
+}
+
+start_conversion() {
+  local in_dir="$1"
+  local out_dir="$2"
+
+  ensure_valid_directories "$in_dir" "$out_dir" || return 1
+  name_audio_files "$in_dir" "$out_dir" || return 1
+  convert_audio_files "$in_dir" "$out_dir"
+}
+
+main() {
+  local in_dir="$1"
+  local out_dir="$2"
+  local debugger="$3"
+
+  if [[ "$debugger" = "debugger" ]]; then
+    IS_DEBUG=true
+    echo "DEBUGGER OUTPUT ENABLED"
+  else
+    IS_DEBUG=false
+  fi
+
+  local status=0
+  start_conversion "$in_dir" "$out_dir" || status=$?
+  rm -rf "$(concat_dir "$out_dir")"
+  return "$status"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
+
